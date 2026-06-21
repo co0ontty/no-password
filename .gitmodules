@@ -1,0 +1,9 @@
+[submodule "browser-extension"]
+	path = browser-extension
+	url = ../no-password-browser-extension
+[submodule "android"]
+	path = android
+	url = ../no-password-android
+[submodule "ios"]
+	path = ios
+	url = ../no-password-ios
