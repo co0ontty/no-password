@@ -6,6 +6,7 @@ export type VaultItem = {
   title: string;
   username: string;
   password: string;
+  otpSecret?: string;
   url: string;
   notes: string;
   tags: string[];
@@ -40,4 +41,3 @@ export type LocalPasskey = {
   email: string;
   createdAt: number;
 };
-

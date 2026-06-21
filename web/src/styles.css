@@ -38,6 +38,11 @@ button {
   color: inherit;
 }
 
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
 .auth-screen,
 .app-screen {
   position: relative;
@@ -465,6 +470,50 @@ small {
 
 .detail-actions {
   margin-top: 18px;
+}
+
+.otp-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  border: 1px solid rgba(255, 255, 255, 0.72);
+  border-radius: 20px;
+  background: rgba(255, 255, 255, 0.5);
+  padding: 14px;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.78);
+}
+
+.otp-card strong {
+  display: block;
+  font-size: 2rem;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0;
+}
+
+.otp-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.otp-actions span {
+  min-width: 48px;
+  color: var(--muted);
+  font-weight: 850;
+  text-align: right;
+}
+
+.otp-actions button {
+  display: grid;
+  width: 40px;
+  height: 40px;
+  place-items: center;
+  border: 0;
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.62);
+  cursor: pointer;
 }
 
 .copy-state {

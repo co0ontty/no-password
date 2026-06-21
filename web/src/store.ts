@@ -111,6 +111,7 @@ function seedItems(): VaultItem[] {
       title: "GitHub",
       username: "alex@example.com",
       password: "Z8q!uQ4p@qN7vL2s",
+      otpSecret: "JBSWY3DPEHPK3PXP",
       url: "https://github.com",
       notes: "Recovery codes stored in secure note.",
       tags: ["work", "dev"],
@@ -123,6 +124,7 @@ function seedItems(): VaultItem[] {
       title: "Stripe",
       username: "billing@example.com",
       password: "K9#tWm6!cQ2xRz8",
+      otpSecret: "",
       url: "https://dashboard.stripe.com",
       notes: "Shared with finance vault later.",
       tags: ["finance"],
@@ -135,6 +137,7 @@ function seedItems(): VaultItem[] {
       title: "Server Recovery",
       username: "",
       password: "",
+      otpSecret: "",
       url: "",
       notes: "Store emergency deployment notes here after replacing this sample.",
       tags: ["infra"],
@@ -143,4 +146,3 @@ function seedItems(): VaultItem[] {
     },
   ];
 }
-

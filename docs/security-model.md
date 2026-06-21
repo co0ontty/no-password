@@ -6,12 +6,15 @@
 - The server should never need the user's master password.
 - Clients should encrypt before sync and decrypt only after local unlock.
 - Passkey features should use standard platform APIs rather than handwritten cryptography.
+- TOTP secrets should be treated like passwords and encrypted inside vault items.
 
 ## Current MVP
 
 The Web MVP uses Web Crypto for local encryption with PBKDF2 and AES-GCM. This makes the prototype usable in modern browsers without native dependencies. The production target should replace the browser KDF with Argon2id or a reviewed WebAssembly Argon2id package.
 
 The Rust server hashes client auth secrets with Argon2id before storage. This protects the server-side credential verifier if the deployment data file leaks.
+
+TOTP generation is local-only. The server receives only the encrypted vault envelope and does not parse, validate, or generate OTP codes.
 
 ## Production Hardening Path
 
@@ -25,4 +28,3 @@ The Rust server hashes client auth secrets with Argon2id before storage. This pr
 ## Browser Extension Boundary
 
 The extension must treat page scripts as hostile. Content scripts should never expose decrypted vault state to the page. Fill actions should pass only the selected credential fields to the isolated content script after explicit user action or a trusted extension decision.
-

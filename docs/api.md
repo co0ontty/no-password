@@ -57,6 +57,8 @@ All vault item contents are opaque encrypted envelopes.
 }
 ```
 
+Login item plaintext may include an `otpSecret` field before client-side encryption. The server must continue treating it as opaque ciphertext.
+
 ## Passkeys
 
 Production passkey API will follow WebAuthn ceremonies:
@@ -67,4 +69,3 @@ Production passkey API will follow WebAuthn ceremonies:
 - `POST /webauthn/login/finish`
 - `GET /webauthn/credentials`
 - `DELETE /webauthn/credentials/:id`
-

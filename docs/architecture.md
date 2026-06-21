@@ -6,7 +6,7 @@ NoPassword is split into a self-hosted sync server and multiple zero-knowledge c
 
 - `server/`: Rust API, static Web app serving, encrypted vault sync, account/session handling, passkey relying-party endpoints in the planned production track.
 - `web/`: primary PWA and desktop fallback for macOS users.
-- `browser-extension/`: Chromium MV3 extension for autofill, save prompts, generator, and future passkey provider experiments.
+- `browser-extension/`: Chromium MV3 extension for autofill, OTP fill, save prompts, generator, and future passkey provider experiments.
 - `android/`: future native Android client using Credential Manager.
 - `ios/`: future native iOS client using AuthenticationServices and Credential Provider Extensions.
 
@@ -17,6 +17,7 @@ NoPassword is split into a self-hosted sync server and multiple zero-knowledge c
 3. The server receives opaque vault envelopes and cannot decrypt item contents.
 4. Clients sync encrypted item envelopes through the Rust API.
 5. Browser extension reads the same encrypted model after unlock and fills matched credentials into pages.
+6. TOTP secrets are stored inside encrypted vault items and generated locally on clients.
 
 ## Passkey Tracks
 
@@ -27,4 +28,3 @@ NoPassword is split into a self-hosted sync server and multiple zero-knowledge c
 ## Domain Requirements
 
 WebAuthn credentials are scoped by RP ID. In private deployments, `NO_PASSWORD_PUBLIC_ORIGIN` and `NO_PASSWORD_RP_ID` must match the final URL users open in browsers. Changing domains after passkeys are registered invalidates those credentials for the new domain.
-

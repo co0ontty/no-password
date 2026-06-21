@@ -31,16 +31,18 @@ import {
   savePasskey,
   unlockVault,
 } from "./store";
+import { generateTotp } from "./totp";
 import type { LocalPasskey, VaultItem, VaultItemKind, VaultSession } from "./types";
 
 type AuthMode = "create" | "unlock";
 type NavView = "vault" | "passkeys" | "settings";
-type Category = "all" | VaultItemKind | "favorites";
+type Category = "all" | VaultItemKind | "favorites" | "otp";
 
 const categories: Array<{ id: Category; label: string }> = [
   { id: "all", label: "All" },
   { id: "favorites", label: "Starred" },
   { id: "login", label: "Logins" },
+  { id: "otp", label: "OTP" },
   { id: "secure-note", label: "Notes" },
   { id: "passkey", label: "Passkeys" },
 ];
@@ -60,6 +62,7 @@ export function App() {
   const [passkeys, setPasskeys] = useState<LocalPasskey[]>(readPasskeys());
   const [passkeyStatus, setPasskeyStatus] = useState("Checking");
   const [secureCopy, setSecureCopy] = useState("");
+  const [otpCode, setOtpCode] = useState<{ code: string; remaining: number } | null>(null);
 
   useEffect(() => {
     void getPasskeySupport().then((support) => {
@@ -83,16 +86,35 @@ export function App() {
     [items, selectedId],
   );
 
+  useEffect(() => {
+    let cancelled = false;
+    const updateOtp = async () => {
+      if (!selected?.otpSecret) {
+        setOtpCode(null);
+        return;
+      }
+      const next = await generateTotp(selected.otpSecret).catch(() => null);
+      if (!cancelled) setOtpCode(next);
+    };
+    void updateOtp();
+    const handle = window.setInterval(updateOtp, 1000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(handle);
+    };
+  }, [selected?.id, selected?.otpSecret]);
+
   const filteredItems = useMemo(() => {
     const needle = query.trim().toLowerCase();
     return items.filter((item) => {
       const categoryMatch =
         category === "all" ||
         (category === "favorites" && item.favorite) ||
+        (category === "otp" && Boolean(item.otpSecret)) ||
         item.kind === category;
       const textMatch =
         !needle ||
-        [item.title, item.username, item.url, item.notes, ...item.tags]
+        [item.title, item.username, item.url, item.notes, item.otpSecret ?? "", ...item.tags]
           .join(" ")
           .toLowerCase()
           .includes(needle);
@@ -124,6 +146,7 @@ export function App() {
       title: kind === "secure-note" ? "Secure Note" : kind === "passkey" ? "New Passkey" : "New Login",
       username: "",
       password: kind === "login" ? generatePassword() : "",
+      otpSecret: "",
       url: "",
       notes: "",
       tags: [],
@@ -370,6 +393,31 @@ export function App() {
                       </div>
                     </label>
                     <label>
+                      OTP Secret
+                      <input
+                        value={selected.otpSecret ?? ""}
+                        onChange={(event) => updateSelected({ otpSecret: event.target.value })}
+                        placeholder="Base32 secret or otpauth:// URI"
+                        autoComplete="one-time-code"
+                      />
+                    </label>
+                    <div className="otp-card">
+                      <div>
+                        <p className="eyebrow">One-time password</p>
+                        <strong>{otpCode?.code ?? "Add secret"}</strong>
+                      </div>
+                      <div className="otp-actions">
+                        <span>{otpCode ? `${otpCode.remaining}s` : "TOTP"}</span>
+                        <button
+                          title="Copy OTP"
+                          disabled={!otpCode}
+                          onClick={() => otpCode && copyValue(otpCode.code, "OTP copied")}
+                        >
+                          <Copy size={16} />
+                        </button>
+                      </div>
+                    </div>
+                    <label>
                       Notes
                       <textarea value={selected.notes} onChange={(event) => updateSelected({ notes: event.target.value })} />
                     </label>
@@ -470,4 +518,3 @@ export function App() {
     </main>
   );
 }
-

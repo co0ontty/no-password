@@ -40,8 +40,7 @@ docker compose up --build
 
 ## Current Scope
 
-- Web/PWA: local encrypted vault MVP, modern minimal Liquid Glass UI, basic local passkey registration flow.
+- Web/PWA: local encrypted vault MVP, modern minimal Liquid Glass UI, TOTP codes, basic local passkey registration flow.
 - Server: Rust API skeleton with opaque encrypted vault sync endpoints.
-- Browser extension: MV3 MVP for form detection, fill, save, and sync plumbing.
+- Browser extension: MV3 MVP for form detection, password/OTP fill, save, and sync plumbing.
 - Android/iOS: repository placeholders and technical direction only.
-
