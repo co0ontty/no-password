@@ -9,9 +9,11 @@ import {
   KeyRound,
   Lock,
   MonitorSmartphone,
+  PlugZap,
   Plus,
   RefreshCcw,
   Search,
+  Server,
   Settings,
   ShieldCheck,
   Sparkles,
@@ -19,6 +21,15 @@ import {
   Trash2,
   Wand2,
 } from "lucide-react";
+import {
+  getTlsSettings,
+  loginWithServer,
+  registerWithServer,
+  saveTlsSettings,
+  testTlsSettings,
+  type ServerSession,
+  type TlsCertificateConfig,
+} from "./api";
 import { generatePassword } from "./crypto";
 import { getPasskeySupport, registerLocalPasskey, verifyLocalPasskey } from "./passkeys";
 import {
@@ -47,6 +58,20 @@ const categories: Array<{ id: Category; label: string }> = [
   { id: "passkey", label: "Passkeys" },
 ];
 
+function suggestedTlsSite(defaultSite: string) {
+  try {
+    const url = new URL(defaultSite);
+    if (url.hostname) {
+      url.protocol = "https:";
+      url.port = "";
+      return url.toString().replace(/\/$/, "");
+    }
+  } catch {
+    // Fall through to the current browser host.
+  }
+  return `https://${window.location.hostname || "localhost"}`;
+}
+
 export function App() {
   const [authMode, setAuthMode] = useState<AuthMode>(hasVault() ? "unlock" : "create");
   const [email, setEmail] = useState("alex@example.com");
@@ -63,6 +88,16 @@ export function App() {
   const [passkeyStatus, setPasskeyStatus] = useState("Checking");
   const [secureCopy, setSecureCopy] = useState("");
   const [otpCode, setOtpCode] = useState<{ code: string; remaining: number } | null>(null);
+  const [serverBaseUrl, setServerBaseUrl] = useState(() => window.location.origin);
+  const [serverPassword, setServerPassword] = useState("");
+  const [serverSession, setServerSession] = useState<ServerSession | null>(null);
+  const [serverStatus, setServerStatus] = useState("Not connected");
+  const [tlsSite, setTlsSite] = useState("");
+  const [tlsCertificatePath, setTlsCertificatePath] = useState("");
+  const [tlsPrivateKeyPath, setTlsPrivateKeyPath] = useState("");
+  const [tlsTestId, setTlsTestId] = useState("");
+  const [tlsStatus, setTlsStatus] = useState("Not tested");
+  const [tlsBusy, setTlsBusy] = useState(false);
 
   useEffect(() => {
     void getPasskeySupport().then((support) => {
@@ -200,6 +235,94 @@ export function App() {
     }
   }
 
+  async function connectServer() {
+    if (!session || !serverPassword) return;
+    setServerStatus("Connecting");
+    try {
+      let auth = await loginWithServer(serverBaseUrl, session.email, serverPassword).catch(async () => {
+        return registerWithServer(serverBaseUrl, session.email, serverPassword);
+      });
+      const nextSession: ServerSession = { baseUrl: serverBaseUrl, token: auth.token };
+      setServerSession(nextSession);
+      setServerPassword("");
+      setServerStatus("Connected");
+      await loadTlsSettings(nextSession);
+    } catch (error) {
+      setServerStatus(error instanceof Error ? error.message : "Connection failed");
+    }
+  }
+
+  async function loadTlsSettings(nextSession: ServerSession) {
+    try {
+      const settings = await getTlsSettings(nextSession);
+      const current = settings.current;
+      setTlsSite(current?.site ?? suggestedTlsSite(settings.defaultSite));
+      setTlsCertificatePath(current?.certificatePath ?? "/app/data/certs/fullchain.pem");
+      setTlsPrivateKeyPath(current?.privateKeyPath ?? "/app/data/certs/privkey.pem");
+      setTlsTestId("");
+      setTlsStatus(current ? "Saved" : "Not tested");
+    } catch (error) {
+      setTlsStatus(error instanceof Error ? error.message : "Could not load TLS settings");
+    }
+  }
+
+  function currentTlsConfig(): TlsCertificateConfig {
+    return {
+      site: tlsSite,
+      certificatePath: tlsCertificatePath,
+      privateKeyPath: tlsPrivateKeyPath,
+    };
+  }
+
+  function updateTlsForm(update: Partial<TlsCertificateConfig>) {
+    if (update.site !== undefined) setTlsSite(update.site);
+    if (update.certificatePath !== undefined) setTlsCertificatePath(update.certificatePath);
+    if (update.privateKeyPath !== undefined) setTlsPrivateKeyPath(update.privateKeyPath);
+    setTlsTestId("");
+    setTlsStatus("Not tested");
+  }
+
+  async function testTlsConfig() {
+    if (!serverSession) {
+      setTlsStatus("Connect server first");
+      return;
+    }
+    setTlsBusy(true);
+    setTlsStatus("Testing");
+    try {
+      const result = await testTlsSettings(serverSession, currentTlsConfig());
+      setTlsTestId(result.testId);
+      setTlsStatus(result.ok ? "Test passed" : result.message);
+    } catch (error) {
+      setTlsTestId("");
+      setTlsStatus(error instanceof Error ? error.message : "Test failed");
+    } finally {
+      setTlsBusy(false);
+    }
+  }
+
+  async function saveTlsConfig() {
+    if (!serverSession) {
+      setTlsStatus("Connect server first");
+      return;
+    }
+    if (!tlsTestId) {
+      setTlsStatus("Run test first");
+      return;
+    }
+    setTlsBusy(true);
+    setTlsStatus("Saving");
+    try {
+      await saveTlsSettings(serverSession, { ...currentTlsConfig(), testId: tlsTestId });
+      setTlsTestId("");
+      setTlsStatus("Saved and reloaded");
+    } catch (error) {
+      setTlsStatus(error instanceof Error ? error.message : "Save failed");
+    } finally {
+      setTlsBusy(false);
+    }
+  }
+
   if (!session) {
     return (
       <main className="auth-screen">
@@ -291,6 +414,8 @@ export function App() {
           <button
             className="ghost-action"
             onClick={() => {
+              setAuthMode("unlock");
+              setAuthError("");
               setSession(null);
               setItems([]);
               setMasterPassword("");
@@ -511,6 +636,72 @@ export function App() {
             <div className="setting-row">
               <span>Install Mode</span>
               <strong>PWA Ready</strong>
+            </div>
+          </div>
+          <div className="admin-panel">
+            <div className="section-heading compact-heading">
+              <div>
+                <p className="eyebrow">Server</p>
+                <h2>TLS</h2>
+              </div>
+              <div className="status-pill compact">
+                <Server size={17} />
+                {serverStatus}
+              </div>
+            </div>
+            <div className="admin-form">
+              <label>
+                Server URL
+                <input value={serverBaseUrl} onChange={(event) => setServerBaseUrl(event.target.value)} />
+              </label>
+              <label>
+                Master password
+                <input
+                  value={serverPassword}
+                  onChange={(event) => setServerPassword(event.target.value)}
+                  type="password"
+                  autoComplete="current-password"
+                />
+              </label>
+              <button className="secondary-action" onClick={connectServer} disabled={!serverPassword}>
+                <PlugZap size={17} />
+                Connect
+              </button>
+            </div>
+
+            <div className="admin-form tls-form">
+              <label>
+                Site URL
+                <input value={tlsSite} onChange={(event) => updateTlsForm({ site: event.target.value })} />
+              </label>
+              <label>
+                Certificate path
+                <input
+                  value={tlsCertificatePath}
+                  onChange={(event) => updateTlsForm({ certificatePath: event.target.value })}
+                />
+              </label>
+              <label>
+                Private key path
+                <input
+                  value={tlsPrivateKeyPath}
+                  onChange={(event) => updateTlsForm({ privateKeyPath: event.target.value })}
+                />
+              </label>
+              <div className="admin-actions">
+                <button className="secondary-action" onClick={testTlsConfig} disabled={!serverSession || tlsBusy}>
+                  <Check size={17} />
+                  Test
+                </button>
+                <button className="primary-action small" onClick={saveTlsConfig} disabled={!serverSession || !tlsTestId || tlsBusy}>
+                  <RefreshCcw size={17} />
+                  Save & Reload
+                </button>
+              </div>
+              <div className={tlsTestId ? "status-pill compact passed" : "status-pill compact"}>
+                <ShieldCheck size={17} />
+                {tlsStatus}
+              </div>
             </div>
           </div>
         </section>

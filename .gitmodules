@@ -1,9 +1,9 @@
 [submodule "browser-extension"]
 	path = browser-extension
-	url = ../no-password-browser-extension
+	url = https://github.com/co0ontty/no-password-browser-extension.git
 [submodule "android"]
 	path = android
-	url = ../no-password-android
+	url = https://github.com/co0ontty/no-password-android.git
 [submodule "ios"]
 	path = ios
-	url = ../no-password-ios
+	url = https://github.com/co0ontty/no-password-ios.git

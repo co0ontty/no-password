@@ -7,7 +7,7 @@ NoPassword is a self-hosted, zero-knowledge password manager prototype with a Ru
 ```text
 web/                 Web/PWA client in the main repository
 server/              Rust self-hosted API and static web server
-docker/              Reverse proxy and deployment examples
+docker/              Server image, embedded Caddy, and deployment files
 docs/                Architecture, security, deployment, API notes
 browser-extension/   Git submodule: browser extension client
 android/             Git submodule: Android placeholder

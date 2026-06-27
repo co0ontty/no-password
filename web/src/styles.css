@@ -237,6 +237,7 @@ textarea:focus {
 }
 
 .primary-action,
+.secondary-action,
 .ghost-action,
 .danger-action,
 .empty-action {
@@ -256,6 +257,11 @@ textarea:focus {
   color: white;
   background: linear-gradient(135deg, #176bff, #22a889);
   box-shadow: 0 16px 32px rgba(37, 125, 147, 0.24);
+}
+
+.secondary-action {
+  color: #214d56;
+  background: rgba(255, 255, 255, 0.62);
 }
 
 .primary-action.small {
@@ -549,6 +555,17 @@ small {
   font-weight: 800;
 }
 
+.status-pill.compact {
+  max-width: 100%;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.status-pill.passed {
+  color: #166f5c;
+  background: rgba(224, 249, 242, 0.72);
+}
+
 .passkey-list,
 .settings-grid {
   display: grid;
@@ -574,6 +591,42 @@ small {
 .setting-row span {
   color: var(--muted);
   font-weight: 800;
+}
+
+.admin-panel {
+  display: grid;
+  gap: 16px;
+  max-width: 760px;
+  margin-top: 24px;
+  padding-top: 22px;
+  border-top: 1px solid rgba(255, 255, 255, 0.62);
+}
+
+.compact-heading h2 {
+  font-size: 1.35rem;
+}
+
+.admin-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: end;
+}
+
+.admin-form.tls-form {
+  grid-template-columns: 1fr;
+}
+
+.admin-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.admin-actions .primary-action,
+.admin-actions .secondary-action {
+  width: auto;
+  padding: 0 16px;
 }
 
 @media (max-width: 860px) {
@@ -616,6 +669,10 @@ small {
 
   .category-row button {
     min-width: 96px;
+  }
+
+  .admin-form {
+    grid-template-columns: 1fr;
   }
 }
 

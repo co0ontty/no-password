@@ -45,6 +45,7 @@ All vault item contents are opaque encrypted envelopes.
 ```json
 {
   "revision": 1,
+  "updatedAt": 1710000000000,
   "items": [
     {
       "id": "item-id",
@@ -57,7 +58,46 @@ All vault item contents are opaque encrypted envelopes.
 }
 ```
 
+`PUT /vault` rejects stale updates with `409 Conflict` when the submitted `revision` is older than the stored vault revision.
+
 Login item plaintext may include an `otpSecret` field before client-side encryption. The server must continue treating it as opaque ciphertext.
+
+## Server TLS Admin
+
+TLS admin endpoints require a bearer token from `POST /auth/login` or `POST /auth/register`.
+
+- `GET /admin/tls`
+- `POST /admin/tls/test`
+- `PUT /admin/tls`
+
+Certificate paths must be absolute paths visible inside the server container.
+
+Test request:
+
+```json
+{
+  "site": "https://vault.example.internal",
+  "certificatePath": "/app/data/certs/fullchain.pem",
+  "privateKeyPath": "/app/data/certs/privkey.pem"
+}
+```
+
+`POST /admin/tls/test` verifies that the files exist, are readable, and pass `caddy validate`.
+It returns a short-lived `testId`.
+
+Save request:
+
+```json
+{
+  "site": "https://vault.example.internal",
+  "certificatePath": "/app/data/certs/fullchain.pem",
+  "privateKeyPath": "/app/data/certs/privkey.pem",
+  "testId": "successful-test-id"
+}
+```
+
+`PUT /admin/tls` only accepts the exact settings that produced the successful test. It writes the
+managed Caddyfile, reloads Caddy, then persists the server setting.
 
 ## Passkeys
 

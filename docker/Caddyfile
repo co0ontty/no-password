@@ -1,8 +1,12 @@
 {
-  auto_https off
+	admin {$NO_PASSWORD_CADDY_ADMIN_ADDRESS:127.0.0.1:2019}
+	http_port 8080
+	https_port 8443
+	storage file_system {
+		root /app/data/caddy
+	}
 }
 
-:80 {
-  reverse_proxy nopassword:8080
+{$NO_PASSWORD_CADDY_SITE:http://:8080} {
+	reverse_proxy 127.0.0.1:{$NO_PASSWORD_PORT:9000}
 }
-
