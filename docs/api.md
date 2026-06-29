@@ -7,6 +7,9 @@ Base path: `/api`
 - `GET /healthz`
 - `GET /config`
 
+`GET /config` includes the current owner account name as `ownerEmail`. The Web client uses this
+public, non-secret value so the login screen can stay password-only after the owner name changes.
+
 ## Auth
 
 - `POST /auth/register`
@@ -17,7 +20,8 @@ Request:
 ```json
 {
   "email": "name@example.com",
-  "authSecret": "client-derived-secret",
+  "authSecret": "client-derived-password-secret",
+  "nextAuthSecret": "optional-password-only-secret-for-legacy-migration",
   "kdf": { "name": "PBKDF2-SHA256", "iterations": 310000 },
   "wrappedKey": "optional-client-envelope"
 }
@@ -35,12 +39,39 @@ Response:
 }
 ```
 
+## Account
+
+- `POST /account/email`
+- `POST /account/password`
+
+Requires a bearer token. Updates the current account name only; it does not change the login
+password or server auth hash.
+
+```json
+{
+  "email": "owner@example.internal"
+}
+```
+
+`POST /account/password` requires a bearer token and the current password-derived auth secret. It
+updates only the server login hash; the client separately re-encrypts and uploads the opaque vault
+blob with the new password.
+
+```json
+{
+  "currentAuthSecret": "client-derived-current-password-secret",
+  "nextAuthSecret": "client-derived-next-password-secret"
+}
+```
+
 ## Vault
 
 - `GET /vault`
 - `PUT /vault`
 
-All vault item contents are opaque encrypted envelopes.
+Vault contents are synchronized as opaque client-encrypted envelopes. The Web client currently sends
+one `encrypted-vault` envelope containing the AES-GCM encrypted vault blob; the server stores and
+returns it without decrypting or parsing the plaintext vault items.
 
 ```json
 {
@@ -48,10 +79,10 @@ All vault item contents are opaque encrypted envelopes.
   "updatedAt": 1710000000000,
   "items": [
     {
-      "id": "item-id",
-      "kind": "login",
-      "cipher": "base64",
-      "nonce": "base64",
+      "id": "vault-blob-v1",
+      "kind": "encrypted-vault",
+      "cipher": "base64-encoded-client-encrypted-vault-blob",
+      "nonce": "vault-blob-iv",
       "updatedAt": 1710000000000
     }
   ]
@@ -60,7 +91,7 @@ All vault item contents are opaque encrypted envelopes.
 
 `PUT /vault` rejects stale updates with `409 Conflict` when the submitted `revision` is older than the stored vault revision.
 
-Login item plaintext may include an `otpSecret` field before client-side encryption. The server must continue treating it as opaque ciphertext.
+Login item plaintext may include an `otpSecret` field before client-side encryption. The server must continue treating vault envelopes as opaque ciphertext.
 
 ## Server TLS Admin
 

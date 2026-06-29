@@ -9,4 +9,5 @@ data/
 server/data/
 web/.vite/
 web/dist/
+web/public/downloads/*.zip
 web/tsconfig.tsbuildinfo

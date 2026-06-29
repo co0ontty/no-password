@@ -16,8 +16,17 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use password_hash::{rand_core::OsRng, SaltString};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use password_hash::{
+    rand_core::{OsRng, RngCore},
+    SaltString,
+};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use sqlx::{
+    sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteSynchronous},
+    SqlitePool,
+};
 use tokio::process::Command;
 use tokio::sync::RwLock;
 use tower_http::{
@@ -26,18 +35,28 @@ use tower_http::{
     trace::TraceLayer,
 };
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-use url::Url;
+use url::{Host, Url};
 use uuid::Uuid;
 
 #[derive(Clone)]
 struct AppState {
     config: AppConfig,
-    store_path: PathBuf,
-    settings_path: PathBuf,
-    store: Arc<RwLock<PersistedStore>>,
-    settings: Arc<RwLock<ServerSettings>>,
-    sessions: Arc<RwLock<HashMap<String, String>>>,
+    db: SqlitePool,
+    startup_auth_secret: Option<String>,
+    sessions: Arc<RwLock<HashMap<String, SessionRecord>>>,
     tls_tests: Arc<RwLock<HashMap<String, PendingTlsTest>>>,
+}
+
+#[derive(Debug, Clone)]
+struct SessionRecord {
+    user_id: String,
+    auth_hash: String,
+}
+
+#[derive(Debug, Clone)]
+struct OwnerPasswordReset {
+    email: String,
+    password: String,
 }
 
 #[derive(Clone)]
@@ -46,6 +65,7 @@ struct AppConfig {
     public_origin: String,
     rp_id: String,
     data_dir: PathBuf,
+    database_path: PathBuf,
     web_dist: PathBuf,
     caddy_bin: String,
     caddy_site: String,
@@ -57,6 +77,12 @@ struct AppConfig {
 }
 
 const TLS_TEST_TTL_MS: u64 = 10 * 60 * 1000;
+const DEFAULT_VAULT_EMAIL: &str = "owner@nopassword.local";
+
+enum CliCommand {
+    Serve,
+    ResetOwnerPassword,
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct PersistedStore {
@@ -135,8 +161,22 @@ struct VaultItemEnvelope {
 struct AuthRequest {
     email: String,
     auth_secret: String,
+    next_auth_secret: Option<String>,
     kdf: Option<serde_json::Value>,
     wrapped_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AccountEmailUpdateRequest {
+    email: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AccountPasswordUpdateRequest {
+    current_auth_secret: String,
+    next_auth_secret: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -158,6 +198,7 @@ struct ConfigResponse {
     public_origin: String,
     rp_id: String,
     passkey_server_api: &'static str,
+    owner_email: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -237,6 +278,13 @@ impl IntoResponse for ApiError {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let command = cli_command_from_args().map_err(|message| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{message}\n\n{}", cli_usage()),
+        )
+    })?;
+
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -246,18 +294,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let config = AppConfig::from_env();
-    tokio::fs::create_dir_all(&config.data_dir).await?;
 
-    let store_path = config.data_dir.join("store.json");
-    let settings_path = config.data_dir.join("server-settings.json");
-    let store = load_store(&store_path).await.unwrap_or_default();
-    let settings = load_settings(&settings_path).await.unwrap_or_default();
+    match command {
+        CliCommand::Serve => serve(config).await?,
+        CliCommand::ResetOwnerPassword => {
+            let reset = reset_owner_password(&config).await?;
+            print_reset_owner_password(&reset.email, &reset.password);
+        }
+    }
+
+    Ok(())
+}
+
+async fn serve(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let db = open_configured_database(&config).await?;
+    let startup_auth_secret = if user_count(&db).await? == 0 {
+        let startup_password = generate_startup_password();
+        print_startup_password(&startup_password);
+        Some(derive_auth_secret(&startup_password))
+    } else {
+        None
+    };
     let state = AppState {
         config: config.clone(),
-        store_path,
-        settings_path,
-        store: Arc::new(RwLock::new(store)),
-        settings: Arc::new(RwLock::new(settings)),
+        db,
+        startup_auth_secret,
         sessions: Arc::new(RwLock::new(HashMap::new())),
         tls_tests: Arc::new(RwLock::new(HashMap::new())),
     };
@@ -273,6 +334,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn cli_command_from_args() -> Result<CliCommand, String> {
+    let args = env::args().skip(1).collect::<Vec<_>>();
+    match args.as_slice() {
+        [] => Ok(CliCommand::Serve),
+        [command] if command == "serve" => Ok(CliCommand::Serve),
+        [command] if command == "reset-owner-password" || command == "reset-startup-password" => {
+            Ok(CliCommand::ResetOwnerPassword)
+        }
+        [command] if command == "-h" || command == "--help" || command == "help" => {
+            println!("{}", cli_usage());
+            std::process::exit(0);
+        }
+        [command, ..] => Err(format!("unknown command: {command}")),
+    }
+}
+
+fn cli_usage() -> &'static str {
+    "Usage:\n  nopassword-server [serve]\n  nopassword-server reset-owner-password\n\nreset-owner-password rotates the current owner server login password without deleting the SQLite database, vault envelopes, TLS files, or Caddy state."
+}
+
 fn build_app(state: AppState) -> Router {
     let web_dist = state.config.web_dist.clone();
     let api = Router::new()
@@ -280,6 +361,8 @@ fn build_app(state: AppState) -> Router {
         .route("/config", get(config_handler))
         .route("/auth/register", post(register))
         .route("/auth/login", post(login))
+        .route("/account/email", post(update_account_email))
+        .route("/account/password", post(update_account_password))
         .route("/vault", get(get_vault).put(put_vault))
         .route("/admin/tls", get(get_tls_settings).put(save_tls_settings))
         .route("/admin/tls/test", post(test_tls_settings))
@@ -290,6 +373,7 @@ fn build_app(state: AppState) -> Router {
     let index = web_dist.join("index.html");
     let assets = web_dist.join("assets");
     let icons = web_dist.join("icons");
+    let downloads = web_dist.join("downloads");
     let manifest = web_dist.join("manifest.webmanifest");
     let favicon = web_dist.join("icons/icon-192.png");
 
@@ -297,6 +381,7 @@ fn build_app(state: AppState) -> Router {
         .nest("/api", api)
         .nest_service("/assets", ServeDir::new(assets))
         .nest_service("/icons", ServeDir::new(icons))
+        .nest_service("/downloads", ServeDir::new(downloads))
         .route_service("/manifest.webmanifest", ServeFile::new(manifest))
         .route_service("/favicon.ico", ServeFile::new(favicon))
         .fallback_service(ServeFile::new(index))
@@ -309,15 +394,58 @@ fn build_app(state: AppState) -> Router {
         )
 }
 
+fn print_startup_password(password: &str) {
+    println!();
+    println!("NoPassword startup password: {password}");
+    println!("Use this password to initialize the vault on first open.");
+    println!();
+}
+
+fn print_reset_owner_password(email: &str, password: &str) {
+    println!();
+    println!("NoPassword owner password reset: {password}");
+    println!("Email: {email}");
+    println!("Server data was preserved. This does not decrypt a browser vault if its local master password was forgotten.");
+    println!();
+}
+
+fn derive_auth_secret(password: &str) -> String {
+    let digest = Sha256::digest(format!("no-password-auth-v2:{password}"));
+    URL_SAFE_NO_PAD.encode(digest)
+}
+
+fn hash_auth_secret(auth_secret: &str) -> Result<String, ApiError> {
+    let salt = SaltString::generate(&mut OsRng);
+    Argon2::default()
+        .hash_password(auth_secret.as_bytes(), &salt)
+        .map_err(|_| ApiError::Internal)
+        .map(|hash| hash.to_string())
+}
+
+fn default_kdf() -> serde_json::Value {
+    serde_json::json!({ "name": "PBKDF2-SHA256", "iterations": 310000 })
+}
+
+fn generate_startup_password() -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%^&*?";
+    let mut bytes = [0u8; 24];
+    let mut rng = OsRng;
+    rng.fill_bytes(&mut bytes);
+    bytes
+        .iter()
+        .map(|byte| ALPHABET[*byte as usize % ALPHABET.len()] as char)
+        .collect()
+}
+
 impl AppConfig {
     fn from_env() -> Self {
         let port = env::var("NO_PASSWORD_PORT")
             .ok()
             .and_then(|value| value.parse::<u16>().ok())
-            .unwrap_or(8080);
+            .unwrap_or(8181);
 
         let public_origin = env::var("NO_PASSWORD_PUBLIC_ORIGIN")
-            .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
+            .unwrap_or_else(|_| "http://127.0.0.1:8181".to_string());
 
         let rp_id = env::var("NO_PASSWORD_RP_ID").unwrap_or_else(|_| {
             Url::parse(&public_origin)
@@ -330,13 +458,17 @@ impl AppConfig {
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("./data"));
 
+        let database_path = env::var("NO_PASSWORD_DATABASE_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| data_dir.join("nopassword.sqlite3"));
+
         let web_dist = env::var("NO_PASSWORD_WEB_DIST")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("../web/dist"));
 
         let caddy_bin = env::var("NO_PASSWORD_CADDY_BIN").unwrap_or_else(|_| "caddy".to_string());
-        let caddy_site =
-            env::var("NO_PASSWORD_CADDY_SITE").unwrap_or_else(|_| public_origin.clone());
+        let caddy_site = env::var("NO_PASSWORD_CADDY_SITE")
+            .unwrap_or_else(|_| caddy_site_address(&public_origin));
         let caddy_admin_address = env::var("NO_PASSWORD_CADDY_ADMIN_ADDRESS")
             .unwrap_or_else(|_| "127.0.0.1:2019".to_string());
         let caddy_storage_dir = env::var("NO_PASSWORD_CADDY_STORAGE_DIR")
@@ -348,17 +480,18 @@ impl AppConfig {
         let caddy_http_port = env::var("NO_PASSWORD_CADDY_HTTP_PORT")
             .ok()
             .and_then(|value| value.parse::<u16>().ok())
-            .unwrap_or(8080);
+            .unwrap_or(8181);
         let caddy_https_port = env::var("NO_PASSWORD_CADDY_HTTPS_PORT")
             .ok()
             .and_then(|value| value.parse::<u16>().ok())
-            .unwrap_or(8443);
+            .unwrap_or(8182);
 
         Self {
             port,
             public_origin,
             rp_id,
             data_dir,
+            database_path,
             web_dist,
             caddy_bin,
             caddy_site,
@@ -387,30 +520,517 @@ async fn load_settings(path: &PathBuf) -> Result<ServerSettings, ApiError> {
     }
 }
 
-async fn save_store(state: &AppState) -> Result<(), ApiError> {
-    let snapshot = state.store.read().await.clone();
-    let bytes = serde_json::to_vec_pretty(&snapshot).map_err(|_| ApiError::Internal)?;
-    if let Some(parent) = state.store_path.parent() {
+async fn open_database(path: &Path) -> Result<SqlitePool, ApiError> {
+    if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent)
             .await
             .map_err(|_| ApiError::Internal)?;
     }
-    tokio::fs::write(&state.store_path, bytes)
+    let options = SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(true)
+        .foreign_keys(true)
+        .synchronous(SqliteSynchronous::Normal);
+
+    SqlitePoolOptions::new()
+        .max_connections(5)
+        .connect_with(options)
         .await
-        .map_err(|_| ApiError::Internal)
+        .map_err(db_error)
 }
 
-async fn save_settings_file(state: &AppState) -> Result<(), ApiError> {
-    let snapshot = state.settings.read().await.clone();
-    let bytes = serde_json::to_vec_pretty(&snapshot).map_err(|_| ApiError::Internal)?;
-    if let Some(parent) = state.settings_path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|_| ApiError::Internal)?;
-    }
-    tokio::fs::write(&state.settings_path, bytes)
+async fn open_configured_database(config: &AppConfig) -> Result<SqlitePool, ApiError> {
+    tokio::fs::create_dir_all(&config.data_dir)
         .await
-        .map_err(|_| ApiError::Internal)
+        .map_err(|_| ApiError::Internal)?;
+    let db = open_database(&config.database_path).await?;
+    initialize_database(&db).await?;
+    migrate_legacy_files(&config.data_dir, &db).await?;
+    Ok(db)
+}
+
+async fn initialize_database(db: &SqlitePool) -> Result<(), ApiError> {
+    let statements = [
+        r#"
+        CREATE TABLE IF NOT EXISTS users (
+            id TEXT PRIMARY KEY,
+            email TEXT NOT NULL UNIQUE,
+            auth_hash TEXT NOT NULL,
+            kdf TEXT NOT NULL,
+            wrapped_key TEXT,
+            created_at INTEGER NOT NULL
+        )
+        "#,
+        r#"
+        CREATE TABLE IF NOT EXISTS vaults (
+            user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+            revision INTEGER NOT NULL DEFAULT 0,
+            items TEXT NOT NULL DEFAULT '[]',
+            updated_at INTEGER NOT NULL DEFAULT 0
+        )
+        "#,
+        r#"
+        CREATE TABLE IF NOT EXISTS server_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at INTEGER NOT NULL
+        )
+        "#,
+    ];
+
+    for statement in statements {
+        sqlx::query(statement).execute(db).await.map_err(db_error)?;
+    }
+    Ok(())
+}
+
+async fn migrate_legacy_files(data_dir: &Path, db: &SqlitePool) -> Result<(), ApiError> {
+    if user_count(db).await? == 0 {
+        let store_path = data_dir.join("store.json");
+        match load_store(&store_path).await {
+            Ok(store) if !store.users.is_empty() => {
+                insert_legacy_store(db, &store).await?;
+                tracing::info!(
+                    path = %store_path.display(),
+                    "migrated legacy JSON store into SQLite database"
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(
+                    path = %store_path.display(),
+                    ?error,
+                    "could not migrate legacy JSON store"
+                );
+            }
+        }
+    }
+
+    if !server_settings_exists(db).await? {
+        let settings_path = data_dir.join("server-settings.json");
+        match load_settings(&settings_path).await {
+            Ok(settings) if settings.tls.is_some() => {
+                save_server_settings(db, &settings).await?;
+                tracing::info!(
+                    path = %settings_path.display(),
+                    "migrated legacy server settings into SQLite database"
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(
+                    path = %settings_path.display(),
+                    ?error,
+                    "could not migrate legacy server settings"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn insert_legacy_store(db: &SqlitePool, store: &PersistedStore) -> Result<(), ApiError> {
+    let mut tx = db.begin().await.map_err(db_error)?;
+    for user in store.users.values() {
+        let kdf = serde_json::to_string(&user.kdf).map_err(|_| ApiError::Internal)?;
+        sqlx::query(
+            r#"
+            INSERT INTO users (id, email, auth_hash, kdf, wrapped_key, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(&user.id)
+        .bind(&user.email)
+        .bind(&user.auth_hash)
+        .bind(kdf)
+        .bind(&user.wrapped_key)
+        .bind(to_i64(user.created_at)?)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_error)?;
+
+        let vault = store.vaults.get(&user.id).cloned().unwrap_or_default();
+        let items = serde_json::to_string(&vault.items).map_err(|_| ApiError::Internal)?;
+        sqlx::query(
+            r#"
+            INSERT INTO vaults (user_id, revision, items, updated_at)
+            VALUES (?, ?, ?, ?)
+            "#,
+        )
+        .bind(&user.id)
+        .bind(to_i64(vault.revision)?)
+        .bind(items)
+        .bind(to_i64(vault.updated_at)?)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_error)?;
+    }
+    tx.commit().await.map_err(db_error)
+}
+
+async fn user_count(db: &SqlitePool) -> Result<i64, ApiError> {
+    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM users")
+        .fetch_one(db)
+        .await
+        .map_err(db_error)
+}
+
+async fn server_settings_exists(db: &SqlitePool) -> Result<bool, ApiError> {
+    let count =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM server_settings WHERE key = 'server'")
+            .fetch_one(db)
+            .await
+            .map_err(db_error)?;
+    Ok(count > 0)
+}
+
+async fn load_server_settings(db: &SqlitePool) -> Result<ServerSettings, ApiError> {
+    let value =
+        sqlx::query_scalar::<_, String>("SELECT value FROM server_settings WHERE key = 'server'")
+            .fetch_optional(db)
+            .await
+            .map_err(db_error)?;
+
+    match value {
+        Some(value) => serde_json::from_str(&value).map_err(|_| ApiError::Internal),
+        None => Ok(ServerSettings::default()),
+    }
+}
+
+async fn save_server_settings(db: &SqlitePool, settings: &ServerSettings) -> Result<(), ApiError> {
+    let value = serde_json::to_string(settings).map_err(|_| ApiError::Internal)?;
+    sqlx::query(
+        r#"
+        INSERT INTO server_settings (key, value, updated_at)
+        VALUES ('server', ?, ?)
+        ON CONFLICT(key) DO UPDATE SET
+            value = excluded.value,
+            updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(value)
+    .bind(to_i64(now_ms())?)
+    .execute(db)
+    .await
+    .map_err(db_error)?;
+    Ok(())
+}
+
+async fn find_user_by_email(db: &SqlitePool, email: &str) -> Result<Option<UserRecord>, ApiError> {
+    let row = sqlx::query_as::<_, (String, String, String, String, Option<String>, i64)>(
+        r#"
+        SELECT id, email, auth_hash, kdf, wrapped_key, created_at
+        FROM users
+        WHERE email = ?
+        "#,
+    )
+    .bind(email)
+    .fetch_optional(db)
+    .await
+    .map_err(db_error)?;
+
+    row.map(user_from_row).transpose()
+}
+
+async fn find_user_by_id(db: &SqlitePool, user_id: &str) -> Result<Option<UserRecord>, ApiError> {
+    let row = sqlx::query_as::<_, (String, String, String, String, Option<String>, i64)>(
+        r#"
+        SELECT id, email, auth_hash, kdf, wrapped_key, created_at
+        FROM users
+        WHERE id = ?
+        "#,
+    )
+    .bind(user_id)
+    .fetch_optional(db)
+    .await
+    .map_err(db_error)?;
+
+    row.map(user_from_row).transpose()
+}
+
+async fn owner_email(db: &SqlitePool) -> Result<String, ApiError> {
+    let email = sqlx::query_scalar::<_, String>(
+        "SELECT email FROM users ORDER BY created_at ASC, rowid ASC LIMIT 1",
+    )
+    .fetch_optional(db)
+    .await
+    .map_err(db_error)?;
+
+    Ok(email.unwrap_or_else(|| DEFAULT_VAULT_EMAIL.to_string()))
+}
+
+async fn owner_user(db: &SqlitePool) -> Result<Option<UserRecord>, ApiError> {
+    let row = sqlx::query_as::<_, (String, String, String, String, Option<String>, i64)>(
+        r#"
+        SELECT id, email, auth_hash, kdf, wrapped_key, created_at
+        FROM users
+        ORDER BY created_at ASC, rowid ASC
+        LIMIT 1
+        "#,
+    )
+    .fetch_optional(db)
+    .await
+    .map_err(db_error)?;
+
+    row.map(user_from_row).transpose()
+}
+
+async fn reset_owner_password(config: &AppConfig) -> Result<OwnerPasswordReset, ApiError> {
+    let password = generate_startup_password();
+    let email = reset_owner_password_to(config, &password).await?;
+    Ok(OwnerPasswordReset { email, password })
+}
+
+async fn reset_owner_password_to(config: &AppConfig, password: &str) -> Result<String, ApiError> {
+    let db = open_configured_database(config).await?;
+    let email = owner_email(&db).await?;
+    rotate_owner_password(&db, &email, password).await?;
+    Ok(email)
+}
+
+async fn rotate_owner_password(
+    db: &SqlitePool,
+    email: &str,
+    password: &str,
+) -> Result<(), ApiError> {
+    let email = normalize_email(email)?;
+    let auth_secret = derive_auth_secret(password);
+    let auth_hash = hash_auth_secret(&auth_secret)?;
+    let mut tx = db.begin().await.map_err(db_error)?;
+    let existing_id = sqlx::query_scalar::<_, String>("SELECT id FROM users WHERE email = ?")
+        .bind(&email)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_error)?;
+
+    let user_id = match existing_id {
+        Some(user_id) => {
+            sqlx::query("UPDATE users SET auth_hash = ? WHERE id = ?")
+                .bind(auth_hash)
+                .bind(&user_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_error)?;
+            user_id
+        }
+        None => {
+            let user_id = Uuid::new_v4().to_string();
+            let kdf = serde_json::to_string(&default_kdf()).map_err(|_| ApiError::Internal)?;
+            sqlx::query(
+                r#"
+                INSERT INTO users (id, email, auth_hash, kdf, wrapped_key, created_at)
+                VALUES (?, ?, ?, ?, NULL, ?)
+                "#,
+            )
+            .bind(&user_id)
+            .bind(&email)
+            .bind(auth_hash)
+            .bind(kdf)
+            .bind(to_i64(now_ms())?)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_error)?;
+            user_id
+        }
+    };
+
+    sqlx::query(
+        r#"
+        INSERT OR IGNORE INTO vaults (user_id, revision, items, updated_at)
+        VALUES (?, 0, '[]', 0)
+        "#,
+    )
+    .bind(&user_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(db_error)?;
+
+    tx.commit().await.map_err(db_error)
+}
+
+async fn update_user_email(
+    db: &SqlitePool,
+    user_id: &str,
+    email: &str,
+) -> Result<UserRecord, ApiError> {
+    let mut user = find_user_by_id(db, user_id)
+        .await?
+        .ok_or(ApiError::Unauthorized)?;
+
+    if let Some(existing) = find_user_by_email(db, email).await? {
+        if existing.id != user.id {
+            return Err(ApiError::Conflict("account already exists".to_string()));
+        }
+    }
+
+    sqlx::query("UPDATE users SET email = ? WHERE id = ?")
+        .bind(email)
+        .bind(user_id)
+        .execute(db)
+        .await
+        .map_err(db_error)?;
+
+    user.email = email.to_string();
+    Ok(user)
+}
+
+async fn update_user_password(
+    db: &SqlitePool,
+    user_id: &str,
+    current_auth_secret: &str,
+    next_auth_secret: &str,
+) -> Result<UserRecord, ApiError> {
+    if current_auth_secret.len() < 32 || next_auth_secret.len() < 32 {
+        return Err(ApiError::BadRequest("authSecret is too short".to_string()));
+    }
+
+    let mut user = find_user_by_id(db, user_id)
+        .await?
+        .ok_or(ApiError::Unauthorized)?;
+    let parsed_hash = PasswordHash::new(&user.auth_hash).map_err(|_| ApiError::Internal)?;
+    Argon2::default()
+        .verify_password(current_auth_secret.as_bytes(), &parsed_hash)
+        .map_err(|_| ApiError::Unauthorized)?;
+
+    let auth_hash = hash_auth_secret(next_auth_secret)?;
+    sqlx::query("UPDATE users SET auth_hash = ? WHERE id = ?")
+        .bind(&auth_hash)
+        .bind(user_id)
+        .execute(db)
+        .await
+        .map_err(db_error)?;
+
+    user.auth_hash = auth_hash;
+    Ok(user)
+}
+
+async fn insert_user_with_vault(db: &SqlitePool, user: &UserRecord) -> Result<(), ApiError> {
+    let mut tx = db.begin().await.map_err(db_error)?;
+    let kdf = serde_json::to_string(&user.kdf).map_err(|_| ApiError::Internal)?;
+    sqlx::query(
+        r#"
+        INSERT INTO users (id, email, auth_hash, kdf, wrapped_key, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind(&user.id)
+    .bind(&user.email)
+    .bind(&user.auth_hash)
+    .bind(kdf)
+    .bind(&user.wrapped_key)
+    .bind(to_i64(user.created_at)?)
+    .execute(&mut *tx)
+    .await
+    .map_err(db_error)?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO vaults (user_id, revision, items, updated_at)
+        VALUES (?, 0, '[]', 0)
+        "#,
+    )
+    .bind(&user.id)
+    .execute(&mut *tx)
+    .await
+    .map_err(db_error)?;
+
+    tx.commit().await.map_err(db_error)
+}
+
+async fn load_vault(db: &SqlitePool, user_id: &str) -> Result<VaultRecord, ApiError> {
+    let row = sqlx::query_as::<_, (i64, String, i64)>(
+        r#"
+        SELECT revision, items, updated_at
+        FROM vaults
+        WHERE user_id = ?
+        "#,
+    )
+    .bind(user_id)
+    .fetch_optional(db)
+    .await
+    .map_err(db_error)?;
+
+    match row {
+        Some((revision, items, updated_at)) => Ok(VaultRecord {
+            revision: to_u64(revision),
+            items: serde_json::from_str(&items).map_err(|_| ApiError::Internal)?,
+            updated_at: to_u64(updated_at),
+        }),
+        None => Ok(VaultRecord::default()),
+    }
+}
+
+async fn save_vault(
+    db: &SqlitePool,
+    user_id: &str,
+    req: VaultPutRequest,
+) -> Result<VaultRecord, ApiError> {
+    let mut tx = db.begin().await.map_err(db_error)?;
+    let current = sqlx::query_as::<_, (i64,)>("SELECT revision FROM vaults WHERE user_id = ?")
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_error)?
+        .ok_or(ApiError::NotFound)?;
+
+    let current_revision = to_u64(current.0);
+    if req.revision < current_revision {
+        return Err(ApiError::Conflict(format!(
+            "stale vault revision: current revision is {}",
+            current_revision
+        )));
+    }
+
+    let vault = VaultRecord {
+        revision: req.revision,
+        items: req.items,
+        updated_at: now_ms(),
+    };
+    let items = serde_json::to_string(&vault.items).map_err(|_| ApiError::Internal)?;
+    sqlx::query(
+        r#"
+        UPDATE vaults
+        SET revision = ?, items = ?, updated_at = ?
+        WHERE user_id = ?
+        "#,
+    )
+    .bind(to_i64(vault.revision)?)
+    .bind(items)
+    .bind(to_i64(vault.updated_at)?)
+    .bind(user_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(db_error)?;
+
+    tx.commit().await.map_err(db_error)?;
+    Ok(vault)
+}
+
+fn user_from_row(
+    row: (String, String, String, String, Option<String>, i64),
+) -> Result<UserRecord, ApiError> {
+    let (id, email, auth_hash, kdf, wrapped_key, created_at) = row;
+    Ok(UserRecord {
+        id,
+        email,
+        auth_hash,
+        kdf: serde_json::from_str(&kdf).map_err(|_| ApiError::Internal)?,
+        wrapped_key,
+        created_at: to_u64(created_at),
+    })
+}
+
+fn to_i64(value: u64) -> Result<i64, ApiError> {
+    i64::try_from(value).map_err(|_| ApiError::Internal)
+}
+
+fn to_u64(value: i64) -> u64 {
+    value.max(0) as u64
+}
+
+fn db_error(error: sqlx::Error) -> ApiError {
+    tracing::error!(?error, "database operation failed");
+    ApiError::Internal
 }
 
 async fn health() -> Json<HealthResponse> {
@@ -420,13 +1040,14 @@ async fn health() -> Json<HealthResponse> {
     })
 }
 
-async fn config_handler(State(state): State<AppState>) -> Json<ConfigResponse> {
-    Json(ConfigResponse {
+async fn config_handler(State(state): State<AppState>) -> Result<Json<ConfigResponse>, ApiError> {
+    Ok(Json(ConfigResponse {
         app_name: "NoPassword",
         public_origin: state.config.public_origin,
         rp_id: state.config.rp_id,
         passkey_server_api: "planned",
-    })
+        owner_email: owner_email(&state.db).await?,
+    }))
 }
 
 async fn webauthn_status() -> Json<serde_json::Value> {
@@ -441,9 +1062,9 @@ async fn get_tls_settings(
     headers: HeaderMap,
 ) -> Result<Json<TlsSettingsResponse>, ApiError> {
     let _user_id = authenticated_user_id(&state, &headers).await?;
-    let settings = state.settings.read().await;
+    let settings = load_server_settings(&state.db).await?;
     Ok(Json(TlsSettingsResponse {
-        current: settings.tls.clone(),
+        current: settings.tls,
         default_site: state.config.caddy_site.clone(),
     }))
 }
@@ -514,11 +1135,13 @@ async fn save_tls_settings(
     };
 
     reload_caddy_with_tls(&state.config, &current).await?;
-    {
-        let mut settings = state.settings.write().await;
-        settings.tls = Some(current.clone());
-    }
-    save_settings_file(&state).await?;
+    save_server_settings(
+        &state.db,
+        &ServerSettings {
+            tls: Some(current.clone()),
+        },
+    )
+    .await?;
 
     Ok(Json(TlsSaveResponse {
         current,
@@ -540,18 +1163,15 @@ async fn register(
         return Err(ApiError::BadRequest("authSecret is too short".to_string()));
     }
 
-    {
-        let store = state.store.read().await;
-        if store.users.contains_key(&email) {
-            return Err(ApiError::Conflict("account already exists".to_string()));
-        }
+    if user_count(&state.db).await? > 0 {
+        return Err(ApiError::Conflict("account already exists".to_string()));
     }
 
-    let salt = SaltString::generate(&mut OsRng);
-    let auth_hash = Argon2::default()
-        .hash_password(req.auth_secret.as_bytes(), &salt)
-        .map_err(|_| ApiError::Internal)?
-        .to_string();
+    if state.startup_auth_secret.as_deref() != Some(req.auth_secret.as_str()) {
+        return Err(ApiError::Unauthorized);
+    }
+
+    let auth_hash = hash_auth_secret(&req.auth_secret)?;
 
     let user = UserRecord {
         id: Uuid::new_v4().to_string(),
@@ -562,14 +1182,9 @@ async fn register(
         created_at: now_ms(),
     };
 
-    {
-        let mut store = state.store.write().await;
-        store.users.insert(email.clone(), user.clone());
-        store.vaults.insert(user.id.clone(), VaultRecord::default());
-    }
-    save_store(&state).await?;
+    insert_user_with_vault(&state.db, &user).await?;
 
-    let token = issue_session(&state, &user.id).await;
+    let token = issue_session(&state, &user).await;
     Ok(Json(AuthResponse {
         token,
         profile: Profile {
@@ -584,22 +1199,78 @@ async fn login(
     payload: Result<Json<AuthRequest>, JsonRejection>,
 ) -> Result<Json<AuthResponse>, ApiError> {
     let req = parse_json(payload)?;
-    let email = normalize_email(&req.email)?;
-    let user = {
-        let store = state.store.read().await;
-        store
-            .users
-            .get(&email)
-            .cloned()
-            .ok_or(ApiError::Unauthorized)?
-    };
+    if req.auth_secret.len() < 32 {
+        return Err(ApiError::BadRequest("authSecret is too short".to_string()));
+    }
+    let mut user = owner_user(&state.db).await?.ok_or(ApiError::Unauthorized)?;
 
     let parsed_hash = PasswordHash::new(&user.auth_hash).map_err(|_| ApiError::Internal)?;
     Argon2::default()
         .verify_password(req.auth_secret.as_bytes(), &parsed_hash)
         .map_err(|_| ApiError::Unauthorized)?;
 
-    let token = issue_session(&state, &user.id).await;
+    if let Some(next_auth_secret) = req.next_auth_secret {
+        if next_auth_secret.len() < 32 {
+            return Err(ApiError::BadRequest("authSecret is too short".to_string()));
+        }
+        if next_auth_secret != req.auth_secret {
+            let auth_hash = hash_auth_secret(&next_auth_secret)?;
+            sqlx::query("UPDATE users SET auth_hash = ? WHERE id = ?")
+                .bind(&auth_hash)
+                .bind(&user.id)
+                .execute(&state.db)
+                .await
+                .map_err(db_error)?;
+            user.auth_hash = auth_hash;
+        }
+    }
+
+    let token = issue_session(&state, &user).await;
+    Ok(Json(AuthResponse {
+        token,
+        profile: Profile {
+            id: user.id,
+            email: user.email,
+        },
+    }))
+}
+
+async fn update_account_email(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    payload: Result<Json<AccountEmailUpdateRequest>, JsonRejection>,
+) -> Result<Json<AuthResponse>, ApiError> {
+    let user_id = authenticated_user_id(&state, &headers).await?;
+    let req = parse_json(payload)?;
+    let email = normalize_email(&req.email)?;
+    let user = update_user_email(&state.db, &user_id, &email).await?;
+    let token = issue_session(&state, &user).await;
+
+    Ok(Json(AuthResponse {
+        token,
+        profile: Profile {
+            id: user.id,
+            email: user.email,
+        },
+    }))
+}
+
+async fn update_account_password(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    payload: Result<Json<AccountPasswordUpdateRequest>, JsonRejection>,
+) -> Result<Json<AuthResponse>, ApiError> {
+    let user_id = authenticated_user_id(&state, &headers).await?;
+    let req = parse_json(payload)?;
+    let user = update_user_password(
+        &state.db,
+        &user_id,
+        &req.current_auth_secret,
+        &req.next_auth_secret,
+    )
+    .await?;
+    let token = issue_session(&state, &user).await;
+
     Ok(Json(AuthResponse {
         token,
         profile: Profile {
@@ -614,10 +1285,7 @@ async fn get_vault(
     headers: HeaderMap,
 ) -> Result<Json<VaultResponse>, ApiError> {
     let user_id = authenticated_user_id(&state, &headers).await?;
-    let vault = {
-        let store = state.store.read().await;
-        store.vaults.get(&user_id).cloned().unwrap_or_default()
-    };
+    let vault = load_vault(&state.db, &user_id).await?;
 
     Ok(Json(VaultResponse {
         revision: vault.revision,
@@ -633,24 +1301,7 @@ async fn put_vault(
 ) -> Result<Json<VaultResponse>, ApiError> {
     let req = parse_json(payload)?;
     let user_id = authenticated_user_id(&state, &headers).await?;
-    let vault = VaultRecord {
-        revision: req.revision,
-        items: req.items,
-        updated_at: now_ms(),
-    };
-
-    {
-        let mut store = state.store.write().await;
-        let current = store.vaults.get(&user_id).ok_or(ApiError::NotFound)?;
-        if req.revision < current.revision {
-            return Err(ApiError::Conflict(format!(
-                "stale vault revision: current revision is {}",
-                current.revision
-            )));
-        }
-        store.vaults.insert(user_id, vault.clone());
-    }
-    save_store(&state).await?;
+    let vault = save_vault(&state.db, &user_id, req).await?;
 
     Ok(Json(VaultResponse {
         revision: vault.revision,
@@ -849,16 +1500,36 @@ where
 
 fn render_caddyfile(config: &AppConfig, settings: &TlsCertificateSettings) -> String {
     format!(
-        "{{\n\tadmin {admin}\n\thttp_port {http_port}\n\thttps_port {https_port}\n\tstorage file_system {{\n\t\troot {storage_root}\n\t}}\n}}\n\n{site} {{\n\ttls {cert} {key}\n\treverse_proxy 127.0.0.1:{server_port}\n}}\n",
+        "{{\n\tadmin {admin}\n\thttp_port {http_port}\n\thttps_port {https_port}\n\tstorage file_system {{\n\t\troot {storage_root}\n\t}}\n}}\n\nhttp://:{http_port} {{\n\treverse_proxy 127.0.0.1:{server_port}\n}}\n\nhttps://:{https_port} {{\n\ttls {cert} {key}\n\treverse_proxy 127.0.0.1:{server_port}\n}}\n",
         admin = config.caddy_admin_address,
         http_port = config.caddy_http_port,
         https_port = config.caddy_https_port,
         storage_root = caddy_quote(config.caddy_storage_dir.to_string_lossy().as_ref()),
-        site = settings.site,
         cert = caddy_quote(&settings.certificate_path),
         key = caddy_quote(&settings.private_key_path),
         server_port = config.port,
     )
+}
+
+fn caddy_site_address(site: &str) -> String {
+    let Ok(url) = Url::parse(site) else {
+        return site.to_string();
+    };
+    if url.scheme() != "https" {
+        return site.to_string();
+    }
+    let Some(port) = url.port() else {
+        return site.to_string();
+    };
+    let Some(host) = url.host() else {
+        return site.to_string();
+    };
+    let host = match host {
+        Host::Domain(value) => value.to_string(),
+        Host::Ipv4(value) => value.to_string(),
+        Host::Ipv6(value) => format!("[{value}]"),
+    };
+    format!("{host}:{port}")
 }
 
 fn caddy_quote(value: &str) -> String {
@@ -883,13 +1554,15 @@ async fn write_text_file(path: &Path, content: &str) -> Result<(), ApiError> {
         .map_err(|_| ApiError::Internal)
 }
 
-async fn issue_session(state: &AppState, user_id: &str) -> String {
+async fn issue_session(state: &AppState, user: &UserRecord) -> String {
     let token = format!("np_{}", Uuid::new_v4().simple());
-    state
-        .sessions
-        .write()
-        .await
-        .insert(token.clone(), user_id.to_string());
+    state.sessions.write().await.insert(
+        token.clone(),
+        SessionRecord {
+            user_id: user.id.clone(),
+            auth_hash: user.auth_hash.clone(),
+        },
+    );
     token
 }
 
@@ -900,13 +1573,27 @@ async fn authenticated_user_id(state: &AppState, headers: &HeaderMap) -> Result<
         .and_then(|value| value.strip_prefix("Bearer "))
         .ok_or(ApiError::Unauthorized)?;
 
-    state
+    let session = state
         .sessions
         .read()
         .await
         .get(token)
         .cloned()
-        .ok_or(ApiError::Unauthorized)
+        .ok_or(ApiError::Unauthorized)?;
+
+    let current_auth_hash =
+        sqlx::query_scalar::<_, String>("SELECT auth_hash FROM users WHERE id = ?")
+            .bind(&session.user_id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(db_error)?;
+
+    if current_auth_hash.as_deref() != Some(session.auth_hash.as_str()) {
+        state.sessions.write().await.remove(token);
+        return Err(ApiError::Unauthorized);
+    }
+
+    Ok(session.user_id)
 }
 
 fn normalize_email(email: &str) -> Result<String, ApiError> {
@@ -1058,6 +1745,428 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn account_email_update_preserves_vault_without_rekeying_login() {
+        let (app, data_dir) = test_app().await;
+        let old_email = test_email();
+        let new_email = test_email();
+        let old_token = register_user(&app, &old_email).await;
+
+        let item = json!({
+            "id": "renamed-owner-item",
+            "kind": "login",
+            "cipher": "renamed-owner-cipher",
+            "nonce": "renamed-owner-nonce",
+            "updatedAt": 12
+        });
+        let (status, _, _) = send_json(
+            &app,
+            json_request(
+                Method::PUT,
+                "/api/vault",
+                json!({ "revision": 4, "items": [item] }),
+                Some(&old_token),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, _, body) = send_json(
+            &app,
+            json_request(
+                Method::POST,
+                "/api/account/email",
+                json!({
+                    "email": new_email.clone()
+                }),
+                Some(&old_token),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["profile"]["email"], new_email);
+        let new_token = body["token"].as_str().unwrap().to_string();
+
+        let (status, _, _) = send_json(
+            &app,
+            json_request(
+                Method::POST,
+                "/api/auth/login",
+                json!({ "email": old_email.clone(), "authSecret": TEST_AUTH_SECRET }),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, _, _) = send_json(
+            &app,
+            json_request(
+                Method::POST,
+                "/api/auth/login",
+                json!({ "email": new_email.clone(), "authSecret": TEST_AUTH_SECRET }),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, _, _) = send_json(
+            &app,
+            authorized_request(Method::GET, "/api/vault", &old_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, _, body) = send_json(
+            &app,
+            authorized_request(Method::GET, "/api/vault", &new_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["revision"], 4);
+        assert_eq!(body["items"][0]["cipher"], "renamed-owner-cipher");
+
+        cleanup(data_dir).await;
+    }
+
+    #[tokio::test]
+    async fn account_password_update_rekeys_login_and_preserves_vault() {
+        let (app, data_dir) = test_app().await;
+        let email = test_email();
+        let old_token = register_user(&app, &email).await;
+        let next_auth_secret = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+        let item = json!({
+            "id": "password-change-item",
+            "kind": "login",
+            "cipher": "password-change-cipher",
+            "nonce": "password-change-nonce",
+            "updatedAt": 12
+        });
+        let (status, _, _) = send_json(
+            &app,
+            json_request(
+                Method::PUT,
+                "/api/vault",
+                json!({ "revision": 5, "items": [item] }),
+                Some(&old_token),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, _, body) = send_json(
+            &app,
+            json_request(
+                Method::POST,
+                "/api/account/password",
+                json!({
+                    "currentAuthSecret": TEST_AUTH_SECRET,
+                    "nextAuthSecret": next_auth_secret
+                }),
+                Some(&old_token),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["profile"]["email"], email);
+        let new_token = body["token"].as_str().unwrap().to_string();
+
+        let (status, _, _) = send_json(
+            &app,
+            authorized_request(Method::GET, "/api/vault", &old_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let (status, _, _) = send_json(
+            &app,
+            json_request(
+                Method::POST,
+                "/api/auth/login",
+                json!({ "email": email.clone(), "authSecret": TEST_AUTH_SECRET }),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let (status, _, _) = send_json(
+            &app,
+            json_request(
+                Method::POST,
+                "/api/auth/login",
+                json!({ "email": test_email(), "authSecret": next_auth_secret }),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, _, body) = send_json(
+            &app,
+            authorized_request(Method::GET, "/api/vault", &new_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["revision"], 5);
+        assert_eq!(body["items"][0]["cipher"], "password-change-cipher");
+
+        cleanup(data_dir).await;
+    }
+
+    #[tokio::test]
+    async fn login_can_migrate_auth_hash_without_changing_account_name() {
+        let (app, data_dir) = test_app().await;
+        let email = test_email();
+        let old_token = register_user(&app, &email).await;
+        let migrated_auth_secret = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+        let (status, _, body) = send_json(
+            &app,
+            json_request(
+                Method::POST,
+                "/api/auth/login",
+                json!({
+                    "email": test_email(),
+                    "authSecret": TEST_AUTH_SECRET,
+                    "nextAuthSecret": migrated_auth_secret
+                }),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["profile"]["email"], email);
+
+        let (status, _, _) = send_json(
+            &app,
+            authorized_request(Method::GET, "/api/vault", &old_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let (status, _, _) = send_json(
+            &app,
+            json_request(
+                Method::POST,
+                "/api/auth/login",
+                json!({ "email": email, "authSecret": TEST_AUTH_SECRET }),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let token =
+            login_user_with_secret(&app, "anything@example.com", migrated_auth_secret).await;
+        let (status, _, _) =
+            send_json(&app, authorized_request(Method::GET, "/api/vault", &token)).await;
+        assert_eq!(status, StatusCode::OK);
+
+        cleanup(data_dir).await;
+    }
+
+    #[tokio::test]
+    async fn additional_registration_is_rejected() {
+        let (app, data_dir) = test_app().await;
+        let first_email = test_email();
+        let second_email = test_email();
+        let _first_token = register_user(&app, &first_email).await;
+
+        let (status, _, body) = send_json(
+            &app,
+            json_request(
+                Method::POST,
+                "/api/auth/register",
+                json!({ "email": second_email, "authSecret": TEST_AUTH_SECRET }),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "conflict: account already exists");
+
+        cleanup(data_dir).await;
+    }
+
+    #[tokio::test]
+    async fn reset_owner_password_preserves_vault_data() {
+        let config = test_config();
+        let data_dir = config.data_dir.clone();
+        let app = test_app_with_config(config.clone()).await;
+        let token = register_user(&app, DEFAULT_VAULT_EMAIL).await;
+
+        let item = json!({
+            "id": "owner-item",
+            "kind": "login",
+            "cipher": "owner-cipher",
+            "nonce": "owner-nonce",
+            "updatedAt": 12
+        });
+        let (status, _, _) = send_json(
+            &app,
+            json_request(
+                Method::PUT,
+                "/api/vault",
+                json!({ "revision": 3, "items": [item] }),
+                Some(&token),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        reset_owner_password_to(&config, "new-owner-password")
+            .await
+            .unwrap();
+
+        let restarted_app = test_app_with_config(config).await;
+        let (status, _, _) = send_json(
+            &restarted_app,
+            json_request(
+                Method::POST,
+                "/api/auth/login",
+                json!({ "email": DEFAULT_VAULT_EMAIL, "authSecret": TEST_AUTH_SECRET }),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let token = login_user_with_secret(
+            &restarted_app,
+            DEFAULT_VAULT_EMAIL,
+            &derive_auth_secret("new-owner-password"),
+        )
+        .await;
+        let (status, _, body) = send_json(
+            &restarted_app,
+            authorized_request(Method::GET, "/api/vault", &token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["revision"], 3);
+        assert_eq!(body["items"][0]["cipher"], "owner-cipher");
+
+        cleanup(data_dir).await;
+    }
+
+    #[tokio::test]
+    async fn reset_owner_password_invalidates_existing_sessions() {
+        let config = test_config();
+        let data_dir = config.data_dir.clone();
+        let app = test_app_with_config(config.clone()).await;
+        let old_token = register_user(&app, DEFAULT_VAULT_EMAIL).await;
+
+        reset_owner_password_to(&config, "rotated-owner-password")
+            .await
+            .unwrap();
+
+        let (status, _, _) = send_json(
+            &app,
+            authorized_request(Method::GET, "/api/vault", &old_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let new_token = login_user_with_secret(
+            &app,
+            DEFAULT_VAULT_EMAIL,
+            &derive_auth_secret("rotated-owner-password"),
+        )
+        .await;
+        let (status, _, _) = send_json(
+            &app,
+            authorized_request(Method::GET, "/api/vault", &new_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        cleanup(data_dir).await;
+    }
+
+    #[tokio::test]
+    async fn legacy_json_store_imports_into_sqlite() {
+        let config = test_config();
+        let data_dir = config.data_dir.clone();
+        tokio::fs::create_dir_all(&data_dir).await.unwrap();
+
+        let email = test_email();
+        let user_id = Uuid::new_v4().to_string();
+        let salt = SaltString::generate(&mut OsRng);
+        let auth_hash = Argon2::default()
+            .hash_password(TEST_AUTH_SECRET.as_bytes(), &salt)
+            .unwrap()
+            .to_string();
+        let item = VaultItemEnvelope {
+            id: "legacy-item".to_string(),
+            kind: "login".to_string(),
+            cipher: "legacy-cipher".to_string(),
+            nonce: "legacy-nonce".to_string(),
+            updated_at: 20,
+        };
+        let store = PersistedStore {
+            users: HashMap::from([(
+                email.clone(),
+                UserRecord {
+                    id: user_id.clone(),
+                    email: email.clone(),
+                    auth_hash,
+                    kdf: json!({ "name": "PBKDF2-SHA256", "iterations": 310000 }),
+                    wrapped_key: Some("legacy-wrapped-key".to_string()),
+                    created_at: 10,
+                },
+            )]),
+            vaults: HashMap::from([(
+                user_id,
+                VaultRecord {
+                    revision: 4,
+                    items: vec![item],
+                    updated_at: 30,
+                },
+            )]),
+        };
+        tokio::fs::write(
+            data_dir.join("store.json"),
+            serde_json::to_vec_pretty(&store).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let app = test_app_with_config(config).await;
+        let token = login_user(&app, &email).await;
+        let (status, _, body) =
+            send_json(&app, authorized_request(Method::GET, "/api/vault", &token)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["revision"], 4);
+        assert_eq!(body["items"][0]["cipher"], "legacy-cipher");
+        assert!(data_dir.join("nopassword-test.sqlite3").exists());
+
+        cleanup(data_dir).await;
+    }
+
+    #[tokio::test]
+    async fn first_registration_requires_startup_secret() {
+        let (app, data_dir) = test_app().await;
+        let email = test_email();
+        let (status, _, body) = send_json(
+            &app,
+            json_request(
+                Method::POST,
+                "/api/auth/register",
+                json!({ "email": email, "authSecret": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" }),
+                None,
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"], "unauthorized");
+
+        cleanup(data_dir).await;
+    }
+
+    #[tokio::test]
     async fn tls_settings_require_successful_test_before_save() {
         let (app, data_dir) = test_app().await;
         let email = test_email();
@@ -1127,6 +2236,9 @@ mod tests {
         tokio::fs::create_dir_all(config.web_dist.join("icons"))
             .await
             .unwrap();
+        tokio::fs::create_dir_all(config.web_dist.join("downloads"))
+            .await
+            .unwrap();
         tokio::fs::write(
             config.web_dist.join("index.html"),
             "<div id=\"root\"></div>",
@@ -1142,6 +2254,12 @@ mod tests {
         tokio::fs::write(config.web_dist.join("icons/icon-192.png"), "png")
             .await
             .unwrap();
+        tokio::fs::write(
+            config.web_dist.join("downloads/no-password-browser-extension.zip"),
+            "zip",
+        )
+        .await
+        .unwrap();
 
         let data_dir = config.data_dir.clone();
         let app = test_app_with_config(config).await;
@@ -1157,6 +2275,14 @@ mod tests {
         let (status, _, body) = send_text(&app, request(Method::GET, "/favicon.ico")).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, "png");
+
+        let (status, _, body) = send_text(
+            &app,
+            request(Method::GET, "/downloads/no-password-browser-extension.zip"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "zip");
 
         cleanup(data_dir).await;
     }
@@ -1177,12 +2303,16 @@ mod tests {
     }
 
     async fn login_user(app: &Router, email: &str) -> String {
+        login_user_with_secret(app, email, TEST_AUTH_SECRET).await
+    }
+
+    async fn login_user_with_secret(app: &Router, email: &str, auth_secret: &str) -> String {
         let (status, _, body) = send_json(
             app,
             json_request(
                 Method::POST,
                 "/api/auth/login",
-                json!({ "email": email, "authSecret": TEST_AUTH_SECRET }),
+                json!({ "email": email, "authSecret": auth_secret }),
                 None,
             ),
         )
@@ -1250,16 +2380,13 @@ mod tests {
 
     async fn test_app_with_config(config: AppConfig) -> Router {
         tokio::fs::create_dir_all(&config.data_dir).await.unwrap();
-        let store_path = config.data_dir.join("store.json");
-        let settings_path = config.data_dir.join("server-settings.json");
-        let store = load_store(&store_path).await.unwrap();
-        let settings = load_settings(&settings_path).await.unwrap();
+        let db = open_database(&config.database_path).await.unwrap();
+        initialize_database(&db).await.unwrap();
+        migrate_legacy_files(&config.data_dir, &db).await.unwrap();
         let state = AppState {
             config,
-            store_path,
-            settings_path,
-            store: Arc::new(RwLock::new(store)),
-            settings: Arc::new(RwLock::new(settings)),
+            db,
+            startup_auth_secret: Some(TEST_AUTH_SECRET.to_string()),
             sessions: Arc::new(RwLock::new(HashMap::new())),
             tls_tests: Arc::new(RwLock::new(HashMap::new())),
         };
@@ -1274,14 +2401,18 @@ mod tests {
             public_origin: "http://127.0.0.1:0".to_string(),
             rp_id: "127.0.0.1".to_string(),
             data_dir,
+            database_path: caddy_storage_dir
+                .parent()
+                .unwrap()
+                .join("nopassword-test.sqlite3"),
             web_dist: PathBuf::from("../web/dist"),
             caddy_bin: "caddy".to_string(),
-            caddy_site: "http://:8080".to_string(),
+            caddy_site: "http://:8181".to_string(),
             caddy_admin_address: "127.0.0.1:2019".to_string(),
             caddy_config_path: caddy_storage_dir.join("managed.Caddyfile"),
             caddy_storage_dir,
-            caddy_http_port: 8080,
-            caddy_https_port: 8443,
+            caddy_http_port: 8181,
+            caddy_https_port: 8182,
         }
     }
 

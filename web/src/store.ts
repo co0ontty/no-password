@@ -4,6 +4,12 @@ import type { LocalPasskey, LocalVaultBlob, VaultItem, VaultSession } from "./ty
 const VAULT_KEY = "np.localVault.v1";
 const PASSKEY_KEY = "np.localPasskeys.v1";
 
+export type VaultUnlockResult = {
+  session: VaultSession;
+  items: VaultItem[];
+  blob: LocalVaultBlob;
+};
+
 export function readVaultBlob(): LocalVaultBlob | null {
   const raw = localStorage.getItem(VAULT_KEY);
   if (!raw) return null;
@@ -18,13 +24,18 @@ export function hasVault(): boolean {
   return readVaultBlob() !== null;
 }
 
-export async function createVault(email: string, masterPassword: string): Promise<{
-  session: VaultSession;
-  items: VaultItem[];
-}> {
+export async function createVault(email: string, masterPassword: string): Promise<VaultUnlockResult> {
+  return createVaultFromItems(email, masterPassword, seedItems());
+}
+
+export async function createVaultFromItems(
+  email: string,
+  masterPassword: string,
+  items: VaultItem[],
+): Promise<VaultUnlockResult> {
   const saltBytes = randomBytes(16);
   const salt = bytesToBase64(saltBytes);
-  const key = await deriveVaultKey(masterPassword, saltBytes);
+  const key = await deriveVaultKey(masterPassword, saltBytes, true);
   const session: VaultSession = {
     email: email.trim().toLowerCase(),
     key,
@@ -35,21 +46,26 @@ export async function createVault(email: string, masterPassword: string): Promis
     },
   };
 
-  const items = seedItems();
-  await persistVault(session, items);
-  return { session, items };
+  const blob = await persistVault(session, items);
+  return { session, items, blob };
 }
 
-export async function unlockVault(masterPassword: string): Promise<{
-  session: VaultSession;
-  items: VaultItem[];
-}> {
+export async function unlockVault(masterPassword: string): Promise<VaultUnlockResult> {
   const blob = readVaultBlob();
   if (!blob) {
     throw new Error("No local vault found");
   }
-  const key = await deriveVaultKey(masterPassword, Uint8Array.from(atob(blob.salt), (char) => char.charCodeAt(0)));
+  return unlockVaultBlob(blob, masterPassword);
+}
+
+export async function unlockVaultBlob(blob: LocalVaultBlob, masterPassword: string): Promise<VaultUnlockResult> {
+  const key = await deriveVaultKey(
+    masterPassword,
+    Uint8Array.from(atob(blob.salt), (char) => char.charCodeAt(0)),
+    true,
+  );
   const items = await decryptJson<VaultItem[]>(key, blob.iv, blob.ciphertext);
+  saveVaultBlob(blob);
   return {
     session: {
       email: blob.email,
@@ -58,10 +74,48 @@ export async function unlockVault(masterPassword: string): Promise<{
       kdf: blob.kdf,
     },
     items,
+    blob,
   };
 }
 
-export async function persistVault(session: VaultSession, items: VaultItem[]): Promise<void> {
+export async function unlockVaultBlobWithKey(
+  blob: LocalVaultBlob,
+  key: CryptoKey,
+): Promise<VaultUnlockResult> {
+  const items = await decryptJson<VaultItem[]>(key, blob.iv, blob.ciphertext);
+  saveVaultBlob(blob);
+  return {
+    session: {
+      email: blob.email,
+      key,
+      salt: blob.salt,
+      kdf: blob.kdf,
+    },
+    items,
+    blob,
+  };
+}
+
+export async function changeVaultPassword(
+  session: VaultSession,
+  items: VaultItem[],
+  currentMasterPassword: string,
+  nextMasterPassword: string,
+): Promise<{ session: VaultSession; blob: LocalVaultBlob }> {
+  await unlockVault(currentMasterPassword);
+  const saltBytes = randomBytes(16);
+  const salt = bytesToBase64(saltBytes);
+  const key = await deriveVaultKey(nextMasterPassword, saltBytes, true);
+  const nextSession: VaultSession = {
+    ...session,
+    key,
+    salt,
+  };
+  const blob = await persistVault(nextSession, items);
+  return { session: nextSession, blob };
+}
+
+export async function persistVault(session: VaultSession, items: VaultItem[]): Promise<LocalVaultBlob> {
   const encrypted = await encryptJson(session.key, items);
   const blob: LocalVaultBlob = {
     version: 1,
@@ -72,6 +126,11 @@ export async function persistVault(session: VaultSession, items: VaultItem[]): P
     kdf: session.kdf,
     updatedAt: Date.now(),
   };
+  saveVaultBlob(blob);
+  return blob;
+}
+
+export function saveVaultBlob(blob: LocalVaultBlob): void {
   localStorage.setItem(VAULT_KEY, JSON.stringify(blob));
 }
 
@@ -98,6 +157,16 @@ export function savePasskey(passkey: LocalPasskey): LocalPasskey[] {
 
 export function removePasskey(id: string): LocalPasskey[] {
   const next = readPasskeys().filter((item) => item.id !== id);
+  localStorage.setItem(PASSKEY_KEY, JSON.stringify(next));
+  return next;
+}
+
+export function renamePasskeyEmail(previousEmail: string, nextEmail: string): LocalPasskey[] {
+  const normalizedPrevious = previousEmail.trim().toLowerCase();
+  const normalizedNext = nextEmail.trim().toLowerCase();
+  const next = readPasskeys().map((item) =>
+    item.email.trim().toLowerCase() === normalizedPrevious ? { ...item, email: normalizedNext } : item,
+  );
   localStorage.setItem(PASSKEY_KEY, JSON.stringify(next));
   return next;
 }

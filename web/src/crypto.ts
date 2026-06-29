@@ -37,7 +37,11 @@ export function base64UrlToBytes(value: string): Uint8Array {
   return base64ToBytes(padded);
 }
 
-export async function deriveVaultKey(masterPassword: string, salt: Uint8Array): Promise<CryptoKey> {
+export async function deriveVaultKey(
+  masterPassword: string,
+  salt: Uint8Array,
+  extractable = false,
+): Promise<CryptoKey> {
   const material = await crypto.subtle.importKey(
     "raw",
     textEncoder.encode(masterPassword),
@@ -58,12 +62,38 @@ export async function deriveVaultKey(masterPassword: string, salt: Uint8Array): 
       name: "AES-GCM",
       length: 256,
     },
-    false,
+    extractable,
     ["encrypt", "decrypt"],
   );
 }
 
-export async function deriveAuthSecret(email: string, masterPassword: string): Promise<string> {
+export async function exportVaultKey(key: CryptoKey): Promise<string> {
+  const raw = await crypto.subtle.exportKey("raw", key);
+  return bytesToBase64(new Uint8Array(raw));
+}
+
+export async function importVaultKey(value: string): Promise<CryptoKey> {
+  return crypto.subtle.importKey(
+    "raw",
+    toArrayBuffer(base64ToBytes(value)),
+    {
+      name: "AES-GCM",
+      length: 256,
+    },
+    true,
+    ["encrypt", "decrypt"],
+  );
+}
+
+export async function deriveAuthSecret(_email: string, masterPassword: string): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    textEncoder.encode(`no-password-auth-v2:${masterPassword}`),
+  );
+  return bytesToBase64Url(new Uint8Array(digest));
+}
+
+export async function deriveLegacyAuthSecret(email: string, masterPassword: string): Promise<string> {
   const digest = await crypto.subtle.digest(
     "SHA-256",
     textEncoder.encode(`no-password-auth-v1:${email.toLowerCase()}:${masterPassword}`),

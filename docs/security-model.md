@@ -10,11 +10,24 @@
 
 ## Current MVP
 
-The Web MVP uses Web Crypto for local encryption with PBKDF2 and AES-GCM. This makes the prototype usable in modern browsers without native dependencies. The production target should replace the browser KDF with Argon2id or a reviewed WebAssembly Argon2id package.
+The Web MVP uses Web Crypto for client-side encryption with PBKDF2 and AES-GCM. The encrypted vault
+blob is cached in browser storage and synchronized through the server so another device can download
+the same ciphertext and decrypt it locally with the user's password. This makes the prototype usable
+in modern browsers without native dependencies. The production target should replace the browser KDF
+with Argon2id or a reviewed WebAssembly Argon2id package.
 
 The Rust server hashes client auth secrets with Argon2id before storage. This protects the server-side credential verifier if the deployment data file leaks.
 
+Server-side account metadata, Argon2id auth hashes, TLS settings, and opaque vault envelopes live in
+the local SQLite database file. Vault item plaintext, TOTP secrets, and master passwords must still
+stay client-side only.
+
 TOTP generation is local-only. The server receives only the encrypted vault envelope and does not parse, validate, or generate OTP codes.
+
+Client-side encryption is an extra application-layer protection for vault contents. It does not make
+plain HTTP safe for the Web app: a network attacker who can modify the HTTP response can replace the
+JavaScript before encryption runs. Production deployments still need trusted HTTPS for code integrity,
+session safety, and phishing-resistant passkey behavior.
 
 ## Production Hardening Path
 
